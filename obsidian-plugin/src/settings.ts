@@ -138,8 +138,6 @@ export class ZobSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl).setName("Zob").setHeading();
-
     const status = containerEl.createEl("p", {
       cls: "zob-settings-status",
       text: "Checking capabilities…",

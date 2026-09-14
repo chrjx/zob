@@ -1031,11 +1031,6 @@ export default class ZobPlugin extends Plugin {
       this.eqCache.delete(k);
       evicted++;
     }
-    if (evicted > 0) {
-      console.log(
-        `[Zob] evicted ${evicted} paper(s) to keep the equation cache under ${this.settings.cacheMaxMB} MB`
-      );
-    }
     return evicted > 0;
   }
 
