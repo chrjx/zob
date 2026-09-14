@@ -1,7 +1,7 @@
 {
   "id": "zob",
   "name": "Zob",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "minAppVersion": "1.4.0",
   "description": "Context-aware completions from the Zotero paper you're reading: citations, equations, theorems, and figures.",
   "author": "Changrong Xue",
