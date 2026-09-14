@@ -36,6 +36,7 @@ import {
 } from "./mineru";
 import { createEmbedder, cosine } from "./embedder";
 import { BlockImportModal, BlockHit } from "./blocks-modal";
+import { RangePromptModal } from "./range-modal";
 import { promises as fs } from "fs";
 
 /** Safety-heartbeat cadence while push (long-poll) updates are active. */
@@ -101,6 +102,8 @@ export default class ZobPlugin extends Plugin {
   private lastAttachmentKey: string | null = null;
   private bridgeOk = false;
   private extracting = false;
+  /** Debounce handle for auto-extraction around the current reading page. */
+  private autoExtractTimer: number | null = null;
   /** Whether the push (long-poll) loop is active. */
   private eventLoopRunning = false;
   /** False once we learn the installed bridge has no /zob/wait endpoint. */
@@ -119,6 +122,7 @@ export default class ZobPlugin extends Plugin {
       statements: Suggestion[];
       figures: Suggestion[];
       blocks: BlockEntry[];
+      coveredRanges: string[];
       lastUsed: number;
     }
   > = new Map();
@@ -170,6 +174,20 @@ export default class ZobPlugin extends Plugin {
       id: "zob-extract-equations",
       name: "Extract paper: equations, theorems, figures (MinerU)",
       callback: () => void this.extractPaper(),
+    });
+
+    this.addCommand({
+      id: "zob-extract-range",
+      name: "Extract page range… (merge into this paper)",
+      callback: () => {
+        const size = Math.max(10, this.settings.autoExtractChunkSize || 100);
+        const page = this.current?.page;
+        const suggested =
+          typeof page === "number" ? chunkFor(page + 1, size) : `1-${size}`;
+        new RangePromptModal(this.app, suggested, (range) =>
+          void this.extractPaper(range)
+        ).open();
+      },
     });
 
     this.addCommand({
@@ -234,6 +252,7 @@ export default class ZobPlugin extends Plugin {
 
   onunload() {
     this.stopPolling();
+    if (this.autoExtractTimer !== null) window.clearTimeout(this.autoExtractTimer);
   }
 
   // ---- update loop (tiered) ---------------------------------------------
@@ -459,6 +478,50 @@ export default class ZobPlugin extends Plugin {
     if (key !== this.indexedKey) {
       void this.rebuildIndex(reading);
     }
+
+    this.maybeAutoExtract(reading);
+  }
+
+  /**
+   * Auto-mode: when enabled, extract the page-chunk around where you're reading,
+   * and — as you read into a new, uncovered chunk — extract + merge that one too.
+   * Needs the live bridge page and a configured extractor. Debounced so flipping
+   * through pages doesn't fire off extractions.
+   */
+  private maybeAutoExtract(reading: CurrentReading | null) {
+    if (!this.settings.autoExtract || !this.caps.extractor || this.extracting) {
+      return;
+    }
+    const att = reading?.attachment;
+    const page0 = reading?.page;
+    if (
+      !att?.path ||
+      att.contentType !== "application/pdf" ||
+      typeof page0 !== "number"
+    ) {
+      return;
+    }
+    const size = Math.max(10, this.settings.autoExtractChunkSize || 100);
+    const covered = this.eqCache.get(att.key)?.coveredRanges ?? [];
+    if (pageInRanges(page0 + 1, covered)) return;
+
+    if (this.autoExtractTimer !== null) window.clearTimeout(this.autoExtractTimer);
+    this.autoExtractTimer = window.setTimeout(() => {
+      this.autoExtractTimer = null;
+      // Re-check once the page has settled (it may have moved or been covered).
+      const cur = this.current;
+      if (
+        !this.settings.autoExtract ||
+        this.extracting ||
+        cur?.attachment?.key !== att.key ||
+        typeof cur?.page !== "number"
+      ) {
+        return;
+      }
+      const cov = this.eqCache.get(att.key)?.coveredRanges ?? [];
+      if (pageInRanges(cur.page + 1, cov)) return;
+      void this.extractPaper(chunkFor(cur.page + 1, size));
+    }, 4000);
   }
 
   // ---- index building ----------------------------------------------------
@@ -759,7 +822,12 @@ export default class ZobPlugin extends Plugin {
 
   // ---- paper extraction (pluggable backend) -----------------------------
 
-  async extractPaper(): Promise<void> {
+  /**
+   * Extract a paper. With `pageRange` (e.g. "101-200") only those pages are sent
+   * to MinerU and the result is MERGED into the paper's cache (dedup + covered
+   * ranges tracked). Without a range, the whole PDF is extracted (replace).
+   */
+  async extractPaper(pageRange?: string): Promise<void> {
     const att = this.current?.attachment;
     if (!att?.path || att.contentType !== "application/pdf") {
       new Notice("Zob: no PDF open in Zotero to extract from.");
@@ -779,36 +847,57 @@ export default class ZobPlugin extends Plugin {
     }
 
     this.extracting = true;
-    const notice = new Notice(`Zob: extracting paper (${extractor.name})…`, 0);
+    const what = pageRange ? `pages ${pageRange}` : "paper";
+    const notice = new Notice(`Zob: extracting ${what} (${extractor.name})…`, 0);
     try {
-      const content = await extractor.extract(att.path, (m) =>
-        notice.setMessage(`Zob: ${m}`)
+      const content = await extractor.extract(
+        att.path,
+        (m) => notice.setMessage(`Zob: ${m}`),
+        pageRange
       );
 
-      const equations = content.equations.map((e, i) => equationSuggestion(e, i));
-      const statements = content.statements.map((s, i) =>
-        statementSuggestion(s, i)
-      );
-      const figures = await this.saveFigures(att.key, content.figures);
+      const newEq = content.equations.map((e, i) => equationSuggestion(e, i));
+      const newSt = content.statements.map((s, i) => statementSuggestion(s, i));
+      const newFig = await this.saveFigures(att.key, content.figures);
+      const newBl: BlockEntry[] = content.blocks.map((b) => ({
+        heading: b.heading,
+        text: b.text,
+        page: b.page,
+      }));
 
       const mtime = (await this.fileMtime(att.path)) ?? Date.now();
-      this.eqCache.set(att.key, {
-        mtime,
-        equations,
-        statements,
-        figures,
-        blocks: content.blocks.map((b) => ({
-          heading: b.heading,
-          text: b.text,
-          page: b.page,
-        })),
-        lastUsed: Date.now(),
-      });
+      const prev = this.eqCache.get(att.key);
+      const entry =
+        pageRange && prev
+          ? {
+              mtime,
+              equations: mergeSuggestions(prev.equations, newEq, eqKey, 900),
+              statements: mergeSuggestions(prev.statements, newSt, stKey, 950),
+              figures: mergeSuggestions(prev.figures, newFig, figKey, 700),
+              blocks: mergeBlocks(prev.blocks, newBl),
+              coveredRanges: addRange(prev.coveredRanges, pageRange),
+              lastUsed: Date.now(),
+            }
+          : {
+              mtime,
+              equations: newEq,
+              statements: newSt,
+              figures: newFig,
+              blocks: newBl,
+              // A whole-PDF extraction covers everything (sentinel) so auto-mode
+              // never re-extracts it; a first ranged extraction covers its range.
+              coveredRanges: pageRange ? [pageRange] : ["1-99999"],
+              lastUsed: Date.now(),
+            };
+      this.eqCache.set(att.key, entry);
       this.enforceCacheLimit(att.key);
       await this.saveEqCache();
 
+      const cov = entry.coveredRanges.length
+        ? ` · pages ${entry.coveredRanges.join(", ")}`
+        : "";
       notice.setMessage(
-        `Zob: ${equations.length} equations, ${statements.length} statements, ${figures.length} figures, ${content.blocks.length} blocks ready.`
+        `Zob: ${entry.equations.length} equations, ${entry.statements.length} statements, ${entry.figures.length} figures, ${entry.blocks.length} blocks${cov}.`
       );
       window.setTimeout(() => notice.hide(), 6000);
     } catch (e: any) {
@@ -873,6 +962,7 @@ export default class ZobPlugin extends Plugin {
           statements?: Suggestion[];
           figures?: Suggestion[];
           blocks?: BlockEntry[];
+          coveredRanges?: string[];
           lastUsed?: number;
         }
       >;
@@ -885,6 +975,7 @@ export default class ZobPlugin extends Plugin {
             statements: (v.statements ?? []).map(backfillPage).map(backfillRender),
             figures: (v.figures ?? []).map(backfillPage).map(backfillRender),
             blocks: v.blocks ?? [],
+            coveredRanges: v.coveredRanges ?? [],
             lastUsed: v.lastUsed ?? 0,
           },
         ])
@@ -1192,6 +1283,79 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     u8.byteOffset,
     u8.byteOffset + u8.byteLength
   ) as ArrayBuffer;
+}
+
+// ---- merge helpers for ranged/incremental extraction ------------------
+
+function eqKey(s: Suggestion): string {
+  return s.render?.type === "equation" ? s.render.latex : s.insert;
+}
+function stKey(s: Suggestion): string {
+  const label = s.render?.type === "statement" ? s.render.label : s.label;
+  return `${label}|${s.page ?? ""}`;
+}
+function figKey(s: Suggestion): string {
+  return `${s.label}|${s.page ?? ""}`;
+}
+
+/** Append incoming items not already present (by key), then re-order by page
+ *  and re-score so document order is preserved across merged ranges. */
+function mergeSuggestions(
+  existing: Suggestion[],
+  incoming: Suggestion[],
+  keyFn: (s: Suggestion) => string,
+  base: number
+): Suggestion[] {
+  const seen = new Set(existing.map(keyFn));
+  const merged = existing.slice();
+  for (const s of incoming) {
+    const k = keyFn(s);
+    if (!seen.has(k)) {
+      seen.add(k);
+      merged.push(s);
+    }
+  }
+  merged.sort((a, b) => (a.page ?? 1e9) - (b.page ?? 1e9));
+  merged.forEach((s, i) => (s.score = base - i));
+  return merged;
+}
+
+function mergeBlocks(existing: BlockEntry[], incoming: BlockEntry[]): BlockEntry[] {
+  const key = (b: BlockEntry) => `${b.heading ?? ""}|${b.text.slice(0, 80)}`;
+  const seen = new Set(existing.map(key));
+  const merged = existing.slice();
+  for (const b of incoming) {
+    const k = key(b);
+    if (!seen.has(k)) {
+      seen.add(k);
+      merged.push(b);
+    }
+  }
+  merged.sort((a, b) => (a.page ?? 1e9) - (b.page ?? 1e9));
+  return merged;
+}
+
+function addRange(existing: string[], range: string): string[] {
+  return existing.includes(range) ? existing : [...existing, range];
+}
+
+/** The aligned page-chunk (1-based "start-end") containing `page1`. */
+function chunkFor(page1: number, size: number): string {
+  const start = Math.floor((page1 - 1) / size) * size + 1;
+  return `${start}-${start + size - 1}`;
+}
+
+/** Is a 1-based page covered by any of the range specs ("101-200", "5,8-9")? */
+function pageInRanges(page1: number, ranges: string[]): boolean {
+  for (const r of ranges) {
+    for (const part of r.split(",")) {
+      const [a, b] = part.split("-").map((x) => parseInt(x.trim(), 10));
+      if (isNaN(a)) continue;
+      const hi = isNaN(b) ? a : b;
+      if (page1 >= a && page1 <= hi) return true;
+    }
+  }
+  return false;
 }
 
 /** Backfill a suggestion's 0-based page from its "p.N" detail if missing. */

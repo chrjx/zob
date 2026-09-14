@@ -59,8 +59,15 @@ export interface Extractor {
   readonly name: string;
   /** Whether the backend has what it needs to run (token, binary, …). */
   isConfigured(): boolean;
-  /** Upload/parse a PDF into structured content. */
-  extract(pdfPath: string, onProgress?: ProgressFn): Promise<ExtractedContent>;
+  /**
+   * Upload/parse a PDF into structured content. `pageRanges` (e.g. "1-200")
+   * limits extraction to those pages; reported pages are made absolute.
+   */
+  extract(
+    pdfPath: string,
+    onProgress?: ProgressFn,
+    pageRanges?: string
+  ): Promise<ExtractedContent>;
 }
 
 export interface MineruOptions {
@@ -71,6 +78,21 @@ export interface MineruOptions {
 }
 
 const API = "https://mineru.net/api/v4";
+
+/** First page number in a range spec ("3-5" -> 3, "10,20-30" -> 10). */
+export function rangeStartPage(spec: string): number {
+  const m = spec.match(/\d+/);
+  return m ? parseInt(m[0], 10) : 1;
+}
+
+/** Shift every page index in a result by `off` (relative -> absolute). */
+function offsetPages(c: ExtractedContent, off: number): void {
+  const bump = (p: number | null) => (typeof p === "number" ? p + off : p);
+  for (const e of c.equations) e.page = bump(e.page);
+  for (const s of c.statements) s.page = bump(s.page);
+  for (const f of c.figures) f.page = bump(f.page);
+  for (const b of c.blocks) b.page = bump(b.page);
+}
 
 /**
  * Extracts equations (as LaTeX) from a local PDF via the MinerU cloud API.
@@ -97,12 +119,20 @@ export class MineruExtractor implements Extractor {
 
   async extract(
     pdfPath: string,
-    onProgress: ProgressFn = () => {}
+    onProgress: ProgressFn = () => {},
+    pageRanges?: string
   ): Promise<ExtractedContent> {
     if (!this.token) throw new Error("MinerU API token is not set.");
 
     const bytes = new Uint8Array(await fs.readFile(pdfPath));
     const name = basename(pdfPath);
+
+    const file: Record<string, unknown> = {
+      name,
+      is_ocr: this.opts.isOcr ?? false,
+    };
+    // page_ranges is a per-file field (not top-level).
+    if (pageRanges) file.page_ranges = pageRanges;
 
     onProgress("requesting upload URL");
     const batch = await requestUrl({
@@ -114,7 +144,7 @@ export class MineruExtractor implements Extractor {
         enable_formula: this.opts.enableFormula ?? true,
         enable_table: this.opts.enableTable ?? true,
         language: this.opts.language ?? "en",
-        files: [{ name, is_ocr: this.opts.isOcr ?? false }],
+        files: [file],
       }),
     });
     if (batch.status !== 200 || batch.json?.code !== 0) {
@@ -139,6 +169,12 @@ export class MineruExtractor implements Extractor {
     onProgress("downloading result");
     const zipRes = await requestUrl({ url: zipUrl, method: "GET", throw: false });
     const content = parseContentFromZip(new Uint8Array(zipRes.arrayBuffer));
+
+    // MinerU numbers a page-ranged result from 0; shift back to absolute pages.
+    if (pageRanges) {
+      const offset = rangeStartPage(pageRanges) - 1;
+      if (offset > 0) offsetPages(content, offset);
+    }
 
     onProgress(
       `found ${content.equations.length} equations, ${content.statements.length} statements, ${content.figures.length} figures`

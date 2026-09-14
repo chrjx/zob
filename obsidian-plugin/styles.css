@@ -21,3 +21,14 @@
   letter-spacing: 0.05em;
   opacity: 0.55;
 }
+
+/* Multi-line capability summary in the settings tab. */
+.zob-settings-status {
+  white-space: pre-line;
+}
+
+/* Monospace, full-width template textareas in settings. */
+.zob-template-input {
+  width: 100%;
+  font-family: var(--font-monospace);
+}

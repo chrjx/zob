@@ -28,6 +28,10 @@ export interface ZobSettings {
   enableEquations: boolean;
   /** Which extractor backend to use (pluggable; MinerU is the first). */
   extractorBackend: "mineru";
+  /** Auto-extract the page-chunk around the current reading page (needs the bridge). */
+  autoExtract: boolean;
+  /** Pages per auto-extraction chunk (MinerU caps a request at 200 pages). */
+  autoExtractChunkSize: number;
   /** Max size (MB) of the parsed-equation cache before least-recently-used papers are evicted. */
   cacheMaxMB: number;
   /** Append a zotero:// page backlink to inserted equations/figures/statements. */
@@ -93,6 +97,8 @@ export const DEFAULT_SETTINGS: ZobSettings = {
   ollamaModel: "nomic-embed-text",
   enableEquations: true,
   extractorBackend: "mineru",
+  autoExtract: false,
+  autoExtractChunkSize: 100,
   cacheMaxMB: 25,
   insertBacklinks: true,
   statementFormat: "callout",
@@ -132,7 +138,7 @@ export class ZobSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Zob" });
+    new Setting(containerEl).setName("Zob").setHeading();
 
     const status = containerEl.createEl("p", {
       cls: "zob-settings-status",
@@ -153,7 +159,6 @@ export class ZobSettingTab extends PluginSettingTab {
           line(extractor, "Content (extractor)", "set a MinerU token below"),
         ].join("\n")
       );
-      status.style.whiteSpace = "pre-line";
     })();
 
     new Setting(containerEl)
@@ -310,8 +315,7 @@ export class ZobSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
         t.inputEl.rows = 8;
-        t.inputEl.style.width = "100%";
-        t.inputEl.style.fontFamily = "var(--font-monospace)";
+        t.inputEl.addClass("zob-template-input");
       });
 
     new Setting(containerEl)
@@ -326,7 +330,7 @@ export class ZobSettingTab extends PluginSettingTab {
         })
       );
 
-    containerEl.createEl("h3", { text: "Insert formats" });
+    new Setting(containerEl).setName("Insert formats").setHeading();
 
     const wideTextArea = (
       get: () => string,
@@ -334,8 +338,7 @@ export class ZobSettingTab extends PluginSettingTab {
     ) => (t: any) => {
       t.setValue(get()).onChange(async (v: string) => set(v));
       t.inputEl.rows = 2;
-      t.inputEl.style.width = "100%";
-      t.inputEl.style.fontFamily = "var(--font-monospace)";
+      t.inputEl.addClass("zob-template-input");
     };
 
     new Setting(containerEl)
@@ -426,7 +429,7 @@ export class ZobSettingTab extends PluginSettingTab {
         )
       );
 
-    containerEl.createEl("h3", { text: "Equations" });
+    new Setting(containerEl).setName("Equations").setHeading();
 
     new Setting(containerEl)
       .setName("Enable equation extraction")
@@ -448,6 +451,33 @@ export class ZobSettingTab extends PluginSettingTab {
           .onChange(async (v) => {
             this.plugin.settings.mineruToken = v.trim();
             await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Auto-extract around current page")
+      .setDesc(
+        "As you read (needs the Zob Bridge for the live page), automatically extract the page-chunk you're in and merge it — extracting further chunks as you read on. Uploads those pages to MinerU."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.autoExtract).onChange(async (v) => {
+          this.plugin.settings.autoExtract = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Auto-extract chunk size (pages)")
+      .setDesc("Pages per auto-extraction. MinerU caps a single request at 200.")
+      .addText((t) =>
+        t
+          .setValue(String(this.plugin.settings.autoExtractChunkSize))
+          .onChange(async (v) => {
+            const n = parseInt(v, 10);
+            if (!isNaN(n) && n >= 10 && n <= 200) {
+              this.plugin.settings.autoExtractChunkSize = n;
+              await this.plugin.saveSettings();
+            }
           })
       );
 
@@ -484,7 +514,7 @@ export class ZobSettingTab extends PluginSettingTab {
           })
       );
 
-    containerEl.createEl("h3", { text: "Semantic block import" });
+    new Setting(containerEl).setName("Semantic block import").setHeading();
 
     new Setting(containerEl)
       .setName("Embedding backend")
