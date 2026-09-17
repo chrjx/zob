@@ -1,6 +1,6 @@
 {
   "name": "zob",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": true,
   "description": "Zotero-aware completions and context for Obsidian.",
   "scripts": {
