@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 /**
  * Zob MCP server — exposes the Zotero paper you're reading to any MCP client
- * (Claude Code, Codex, Cursor, Claudian, …). Read-only tools:
- *   current_paper     — what's open in Zotero's reader
+ * (Claude Code, Codex, Cursor, Claudian, …). Tools:
+ *   current_paper     — what's open in Zotero's reader (+ what's extracted)
+ *   search_library    — find any paper in the library by title/author/year
  *   list_annotations  — your highlights (text, comment, color, page, key)
  *   get_content       — equations / statements / figures from Zob's cache
+ *   get_blocks        — prose+equation blocks for semantic import
  *   get_fulltext      — the PDF's extracted text (Zotero fulltext index)
+ *   insert_into_note  — write Markdown back into the vault
  *
  * Config via env: ZOB_ZOTERO_PORT (default 23119), ZOB_ZOTERO_USER
  * (default "0" — the local-API alias), ZOB_VAULT (path to the Obsidian vault,
@@ -99,6 +102,22 @@ server.registerTool(
     try {
       const cur = await currentReading();
       const it = cur?.item ?? {};
+      const attKey = cur?.attachment?.key;
+      // Surface what's already extracted so the agent knows whether to use
+      // get_content/get_blocks or ask for extraction first.
+      let coveredRanges: any[] | undefined;
+      let extracted = false;
+      if (attKey && VAULT) {
+        try {
+          const entry = (await readCache())[attKey];
+          if (entry) {
+            extracted = true;
+            coveredRanges = entry.coveredRanges ?? [];
+          }
+        } catch {
+          /* cache optional */
+        }
+      }
       return text({
         open: cur?.open,
         title: it.title,
@@ -109,9 +128,11 @@ server.registerTool(
         publicationTitle: it.publicationTitle,
         abstract: it.abstractNote,
         citationKey: it.citationKey,
-        attachmentKey: cur?.attachment?.key,
+        attachmentKey: attKey,
         page: cur?.page,
         selectedAnnotations: cur?.selectedAnnotations ?? [],
+        extracted,
+        coveredRanges: coveredRanges ?? [],
       });
     } catch (e) {
       return errText(e);
@@ -169,6 +190,67 @@ server.registerTool(
 );
 
 server.registerTool(
+  "search_library",
+  {
+    description:
+      "Search your whole Zotero library by title / author / year (not just the open paper). Returns candidate papers with title, creators, date, citation key, a zotero:// backlink, and — when available — the best PDF attachmentKey to pass to get_content / get_blocks / list_annotations. Use this to pull up a paper other than the one currently open in the reader.",
+    inputSchema: {
+      query: z.string(),
+      limit: z.number().optional(),
+    },
+  },
+  async ({ query, limit }) => {
+    try {
+      const cap = Math.max(1, Math.min(limit ?? 8, 25));
+      const rows = await zoteroGet(
+        `/api/users/${ZOTERO_USER}/items/top?q=${encodeURIComponent(
+          query
+        )}&qmode=titleCreatorYear&limit=${cap}`
+      );
+      const items = (Array.isArray(rows) ? rows : []).filter(
+        (r: any) =>
+          r?.data?.itemType !== "attachment" && r?.data?.itemType !== "note"
+      );
+      const results = await Promise.all(
+        items.map(async (r: any) => {
+          const d = r.data ?? {};
+          let attachmentKey: string | undefined;
+          try {
+            const kids = await zoteroGet(
+              `/api/users/${ZOTERO_USER}/items/${r.key}/children`
+            );
+            const pdf = (Array.isArray(kids) ? kids : []).find(
+              (c: any) =>
+                c?.data?.itemType === "attachment" &&
+                /pdf/i.test(c?.data?.contentType ?? "")
+            );
+            attachmentKey = pdf?.key;
+          } catch {
+            /* attachment optional */
+          }
+          return {
+            key: r.key,
+            itemType: d.itemType,
+            title: d.title,
+            date: d.date,
+            creators: (d.creators ?? []).map((c: any) => ({
+              firstName: c.firstName,
+              lastName: c.lastName ?? c.name,
+            })),
+            citationKey: d.citationKey ?? r.meta?.citationKey,
+            attachmentKey,
+            backlink: `zotero://select/library/items/${r.key}`,
+          };
+        })
+      );
+      return text({ count: results.length, results });
+    } catch (e) {
+      return errText(e);
+    }
+  }
+);
+
+server.registerTool(
   "get_content",
   {
     description:
@@ -212,7 +294,7 @@ server.registerTool(
         return items;
       };
       const want = kind ?? "all";
-      const out: any = { attachmentKey: key };
+      const out: any = { attachmentKey: key, coveredRanges: entry.coveredRanges ?? [] };
       if (want === "all" || want === "equation") out.equations = pick(entry.equations);
       if (want === "all" || want === "statement") out.statements = pick(entry.statements);
       if (want === "all" || want === "figure") out.figures = pick(entry.figures);
@@ -260,7 +342,12 @@ server.registerTool(
         );
       }
       items = items.slice(0, typeof limit === "number" ? limit : 50);
-      return text({ attachmentKey: key, count: items.length, blocks: items });
+      return text({
+        attachmentKey: key,
+        coveredRanges: entry?.coveredRanges ?? [],
+        count: items.length,
+        blocks: items,
+      });
     } catch (e) {
       return errText(e);
     }

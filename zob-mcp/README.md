@@ -9,7 +9,8 @@ reasoning; **no API key is needed here.** Zob is just the context provider.
 
 | Tool | Args | Returns |
 | --- | --- | --- |
-| `current_paper` | — | The paper open in Zotero's reader: title, authors, DOI, abstract, `attachmentKey`, current `page`, and `selectedAnnotations` (keys selected in the reader). |
+| `current_paper` | — | The paper open in Zotero's reader: title, authors, DOI, abstract, `attachmentKey`, current `page`, `selectedAnnotations`, and whether it's been `extracted` (+ `coveredRanges`, the page ranges in Zob's cache). |
+| `search_library` | `query`, `limit?` | Find **any** paper in the library by title/author/year (not just the open one). Each hit has title, creators, date, citation key, a `zotero://select` backlink, and — when present — the best PDF `attachmentKey` to pass to the content tools. |
 | `list_annotations` | `attachmentKey?`, `color?`, `selectedOnly?` | Your highlights: text, comment, color, page, annotation key, `zotero://…?annotation=` backlink. `selectedOnly` returns just the annotation(s) selected in the reader right now. |
 | `get_content` | `attachmentKey?`, `kind?` (`equation`/`statement`/`figure`/`all`), `query?`, `limit?` | Extracted content from Zob's MinerU cache, with ready-to-insert markdown + page. |
 | `get_blocks` | `attachmentKey?`, `query?`, `limit?` | Prose blocks (paragraph + its equations + section heading). Read them, semantically pick the one matching the user's phrase, insert its markdown. |
@@ -42,18 +43,40 @@ cd zob-mcp && npm install && npm run build   # -> dist/index.js
 
 ### Claude Code
 ```bash
-claude mcp add zob \
+claude mcp add zob -s user \
   -e ZOB_VAULT=/Users/chrix/Documents/Obsidian \
-  -- node /Users/chrix/Projects/zob-complete/zob-mcp/dist/index.js
+  -e ZOB_ZOTERO_PORT=23119 \
+  -e ZOB_INBOX="Zob Inbox.md" \
+  -- node /Users/chrix/Projects/obzo-complete/zob-mcp/dist/index.js
 ```
+`-s user` registers it for every project; check with `claude mcp list` (expect
+`zob … ✔ Connected`).
 
-### Claude Desktop / Claudian / Codex (JSON config)
+### Codex (`~/.codex/config.toml`)
+```toml
+[mcp_servers.zob]
+command = "node"
+args = ["/Users/chrix/Projects/obzo-complete/zob-mcp/dist/index.js"]
+
+[mcp_servers.zob.env]
+ZOB_VAULT = "/Users/chrix/Documents/Obsidian"
+ZOB_ZOTERO_PORT = "23119"
+ZOB_INBOX = "Zob Inbox.md"
+```
+Verify with `codex mcp list` (should show `zob … enabled`).
+
+### Claudian
+Claudian runs the Claude Code / Codex CLI *inside Obsidian*, so it **inherits
+whichever config you set above** — no separate registration. Just make sure the
+CLI you point Claudian at is the one you registered `zob` with.
+
+### Claude Desktop / other JSON clients
 ```json
 {
   "mcpServers": {
     "zob": {
       "command": "node",
-      "args": ["/Users/chrix/Projects/zob-complete/zob-mcp/dist/index.js"],
+      "args": ["/Users/chrix/Projects/obzo-complete/zob-mcp/dist/index.js"],
       "env": { "ZOB_VAULT": "/Users/chrix/Documents/Obsidian" }
     }
   }
@@ -74,8 +97,8 @@ drive this server — no Anthropic/OpenAI API key required:
   server with `claude mcp add zob …` (above); drive it interactively, or
   headless with `claude -p "…"` for scripting. Claude Code can also *be* an MCP
   server (`claude mcp serve`).
-- **Codex** runs on your **ChatGPT** plan via its local app/CLI; point its MCP
-  config at the JSON above.
+- **Codex** runs on your **ChatGPT** plan via its local app/CLI; add the
+  `[mcp_servers.zob]` block above to `~/.codex/config.toml`.
 - **Claudian** embeds these agent CLIs *inside Obsidian*, so the whole
   read → reason → write loop happens in your vault on your subscription.
 
