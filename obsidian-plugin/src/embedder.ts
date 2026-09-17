@@ -66,9 +66,25 @@ class OllamaEmbedder implements Embedder {
   async embed(texts: string[], type: "document" | "query"): Promise<number[][]> {
     if (texts.length === 0) return [];
     const inputs = texts.map((t) => this.prefix(clip(t), type));
+    // Chunk so a large paper doesn't overwhelm one /api/embed request (which can
+    // partial/fail). Assert each batch returns as many vectors as it was sent.
+    const CHUNK = 64;
+    const out: number[][] = [];
+    for (let i = 0; i < inputs.length; i += CHUNK) {
+      const batch = inputs.slice(i, i + CHUNK);
+      const vecs = await this.embedBatch(batch);
+      if (vecs.length !== batch.length) {
+        throw new Error(
+          `Ollama returned ${vecs.length}/${batch.length} embeddings for '${this.model}'.`
+        );
+      }
+      out.push(...vecs);
+    }
+    return out;
+  }
 
-    // Preferred: batch /api/embed (current Ollama). Fall back to per-text
-    // /api/embeddings for older servers.
+  private async embedBatch(inputs: string[]): Promise<number[][]> {
+    // Preferred: batch /api/embed (current Ollama).
     const batch = await requestUrl({
       url: `${this.baseUrl}/api/embed`,
       method: "POST",
@@ -82,7 +98,7 @@ class OllamaEmbedder implements Embedder {
     if (batch.status !== 404 && batch.status !== 400) {
       throw new Error(ollamaError(batch.status, batch.json, batch.text, this.model));
     }
-
+    // Fall back to per-text /api/embeddings for older servers.
     const out: number[][] = [];
     for (const prompt of inputs) {
       const r = await requestUrl({

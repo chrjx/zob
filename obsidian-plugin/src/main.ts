@@ -206,6 +206,14 @@ export default class ZobPlugin extends Plugin {
           );
           return;
         }
+        // Backfill vectors in the background (one-time per paper; persists).
+        // The modal works (lexically) meanwhile and improves once vectors land.
+        const key = this.current?.attachment?.key;
+        if (key) {
+          const prep = new Notice("Zob: preparing block search…", 0);
+          void this.ensureBlockVectors(key, (m) => prep.setMessage(`Zob: ${m}`))
+            .finally(() => prep.hide());
+        }
         new BlockImportModal(
           this.app,
           editor,
@@ -748,10 +756,74 @@ export default class ZobPlugin extends Plugin {
     return !!key && (this.eqCache.get(key)?.blocks.length ?? 0) > 0;
   }
 
+  /** Build the configured embedder from settings (or null). */
+  private embedder() {
+    return createEmbedder({
+      backend: this.settings.embedderBackend,
+      voyageApiKey: this.settings.voyageApiKey,
+      voyageModel: this.settings.embedModel,
+      ollamaUrl: this.settings.ollamaUrl,
+      ollamaModel: this.settings.ollamaModel,
+    });
+  }
+
+  /** Embed the given blocks in place (attaches `.vector`), chunked by the
+   *  embedder. Returns false if no embedder is configured or the count didn't
+   *  match. Does not persist — the caller owns saving. */
+  private async embedBlocks(
+    blocks: BlockEntry[],
+    onProgress?: (msg: string) => void
+  ): Promise<boolean> {
+    if (blocks.length === 0) return true;
+    const embedder = this.embedder();
+    if (!embedder) return false;
+    onProgress?.(`embedding ${blocks.length} blocks (${embedder.name})…`);
+    const texts = blocks.map((b) => (b.heading ? b.heading + ". " : "") + b.text);
+    const vecs = await embedder.embed(texts, "document");
+    if (vecs.length !== blocks.length) return false;
+    blocks.forEach((b, i) => (b.vector = vecs[i]));
+    return true;
+  }
+
+  /** Backfill a paper's block vectors (missing ones, or all on a model change),
+   *  persisting the result. Used when the Import-block modal opens. */
+  async ensureBlockVectors(
+    key: string,
+    onProgress?: (msg: string) => void
+  ): Promise<void> {
+    const entry = this.eqCache.get(key);
+    if (!entry || entry.blocks.length === 0) return;
+    const embedder = this.embedder();
+    if (!embedder) return; // no embedder — searchBlocks falls back to lexical
+
+    let need = entry.blocks.filter((b) => !b.vector);
+    // If existing vectors came from a different model (dim mismatch), re-embed all.
+    const existing = entry.blocks.find((b) => b.vector);
+    if (existing?.vector) {
+      try {
+        const [probe] = await embedder.embed(["probe"], "query");
+        if (probe && probe.length !== existing.vector.length) {
+          entry.blocks.forEach((b) => (b.vector = undefined));
+          need = entry.blocks;
+        }
+      } catch {
+        return; // embedder unreachable — lexical fallback
+      }
+    }
+    if (need.length === 0) return;
+    try {
+      if (await this.embedBlocks(need, onProgress)) await this.saveEqCache();
+    } catch (e) {
+      console.error("[Zob] ensureBlockVectors failed", e);
+    }
+  }
+
   /**
-   * Rank the current paper's blocks against a query. Uses Voyage embeddings
-   * (semantic) when a key is set, always layering a heading/text lexical boost;
-   * falls back to pure lexical matching without a key.
+   * Rank the current paper's cached blocks against a query. Semantic (embedding)
+   * ranking when vectors are present, always with a lexical bump; pure lexical
+   * fallback when the embedder is unavailable. Never drops blocks merely for
+   * lacking a vector, and uses a relative cutoff so late-page hits still show.
+   * Embedding is NOT done here (see extractPaper / ensureBlockVectors).
    */
   async searchBlocks(query: string): Promise<BlockHit[]> {
     const key = this.current?.attachment?.key;
@@ -760,51 +832,51 @@ export default class ZobPlugin extends Plugin {
     if (!entry || entry.blocks.length === 0) return [];
     const blocks = entry.blocks;
     const q = query.trim().toLowerCase();
+    const toHit = (b: BlockEntry): BlockHit => ({
+      heading: b.heading,
+      text: b.text,
+      page: b.page,
+    });
 
     let queryVec: number[] | null = null;
-    const embedder = createEmbedder({
-      backend: this.settings.embedderBackend,
-      voyageApiKey: this.settings.voyageApiKey,
-      voyageModel: this.settings.embedModel,
-      ollamaUrl: this.settings.ollamaUrl,
-      ollamaModel: this.settings.ollamaModel,
-    });
-    if (embedder && q.length >= 2) {
-      // Embed the query first (cheap) — its dimension identifies the model.
-      const [qv] = await embedder.embed([query], "query");
-      queryVec = qv ?? null;
-      const dim = qv?.length ?? 0;
-      // Re-embed blocks if missing, or if cached vectors came from a different
-      // model (dimension mismatch after switching backend/model).
-      const stale =
-        !!blocks[0]?.vector && dim > 0 && blocks[0].vector!.length !== dim;
-      if (dim > 0 && (blocks.some((b) => !b.vector) || stale)) {
-        const texts = blocks.map((b) => (b.heading ? b.heading + ". " : "") + b.text);
-        const vecs = await embedder.embed(texts, "document");
-        blocks.forEach((b, i) => (b.vector = vecs[i]));
-        await this.saveEqCache();
+    const embedder = this.embedder();
+    if (embedder && blocks.some((b) => b.vector) && q.length >= 2) {
+      try {
+        const [qv] = await embedder.embed([query], "query");
+        queryVec = qv ?? null;
+      } catch (e) {
+        console.error("[Zob] query embed failed; lexical only", e);
       }
     }
 
     const scored = blocks.map((b) => {
-      let score = queryVec && b.vector ? cosine(queryVec, b.vector) : 0;
+      const sem =
+        queryVec && b.vector && b.vector.length === queryVec.length
+          ? cosine(queryVec, b.vector)
+          : 0;
+      let lex = 0;
       if (q) {
         const heading = (b.heading ?? "").toLowerCase();
-        if (heading.includes(q)) score += 0.6; // heading match is a strong signal
-        else if (b.text.toLowerCase().includes(q)) score += 0.3;
+        if (heading.includes(q)) lex = 0.5;
+        else if (b.text.toLowerCase().includes(q)) lex = 0.3;
       }
-      return { b, score };
+      // Semantic drives when available; lexical is a bump (or the whole score
+      // when there's no query vector).
+      return { b, score: queryVec ? sem + lex * 0.3 : lex };
     });
 
-    const ranked = q
-      ? scored.filter((x) => x.score > 0.05)
-      : scored; // empty query → browse all
-    ranked.sort((a, b) => b.score - a.score);
-    return ranked.slice(0, 25).map((x) => ({
-      heading: x.b.heading,
-      text: x.b.text,
-      page: x.b.page,
-    }));
+    scored.sort((a, b) => b.score - a.score);
+    if (!q) return scored.slice(0, 25).map((x) => toHit(x.b));
+
+    // Relative cutoff: keep everything within 60% of the best score, so a
+    // slightly-lower late-page block isn't excluded by an absolute threshold.
+    // No positive score at all → honest "no match" (don't show arbitrary blocks).
+    const top = scored[0]?.score ?? 0;
+    if (top <= 0) return [];
+    return scored
+      .filter((x) => x.score >= Math.max(top * 0.6, 0.01))
+      .slice(0, 25)
+      .map((x) => toHit(x.b));
   }
 
   /** Insert a block's markdown (paragraph + equations) into the active note. */
@@ -864,6 +936,13 @@ export default class ZobPlugin extends Plugin {
         text: b.text,
         page: b.page,
       }));
+      // Embed just this range's blocks now (bounded, reliable) so search never
+      // has to embed the whole paper at once. Non-fatal if the embedder is down.
+      try {
+        await this.embedBlocks(newBl, (m) => notice.setMessage(`Zob: ${m}`));
+      } catch (e) {
+        console.error("[Zob] block embedding failed (will fall back to lexical)", e);
+      }
 
       const mtime = (await this.fileMtime(att.path)) ?? Date.now();
       const prev = this.eqCache.get(att.key);
