@@ -12,7 +12,8 @@ export type SuggestionKind =
   | "equation"
   | "citation"
   | "statement"
-  | "figure-image";
+  | "figure-image"
+  | "block";
 
 export interface Suggestion {
   kind: SuggestionKind;

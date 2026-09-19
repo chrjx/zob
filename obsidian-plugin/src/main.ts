@@ -62,6 +62,22 @@ export interface Capabilities {
   bridge: boolean;
   /** Tier 2: an extractor is configured (MinerU token) for equations/theorems/figures. */
   extractor: boolean;
+  /** Tier 3: an embedder is configured (Voyage key or Ollama model) for semantic block import. */
+  embedder: boolean;
+}
+
+/** Reachability + identity of the configured embedder, for status display. */
+export interface EmbedderHealth {
+  /** An embedder is set up (key/model present). */
+  configured: boolean;
+  /** It actually responded (Ollama server up + model present; Voyage key present). */
+  reachable: boolean;
+  /** Display name: "Ollama" | "Voyage". */
+  backend: string;
+  /** Model id. */
+  model: string;
+  /** Short hint shown when not reachable (e.g. "run 'ollama serve'"). */
+  note: string;
 }
 
 /** Status-bar prefix reflecting how the current paper was resolved (its tier). */
@@ -92,7 +108,20 @@ export default class ZobPlugin extends Plugin {
   pinnedReading: CurrentReading | null = null;
 
   /** Which capability tiers are currently available (updated each heartbeat). */
-  caps: Capabilities = { zotero: false, bridge: false, extractor: false };
+  caps: Capabilities = {
+    zotero: false,
+    bridge: false,
+    extractor: false,
+    embedder: false,
+  };
+
+  /** Cached embedder reachability probe (refreshed lazily, never on the timer). */
+  private embedderHealthCache: { at: number; health: EmbedderHealth } | null =
+    null;
+
+  /** Papers whose block vectors we've already kicked off a backfill for this
+   *  session (so the inline block trigger doesn't re-embed on every keystroke). */
+  private blocksEnsured = new Set<string>();
 
   /** Vault notes indexed by Zotero identifiers (for citation ↔ note linking). */
   noteIndex!: NoteIndex;
@@ -218,7 +247,8 @@ export default class ZobPlugin extends Plugin {
           this.app,
           editor,
           (q) => this.searchBlocks(q),
-          (hit, ed) => this.insertBlock(hit, ed)
+          (hit, ed) => this.insertBlock(hit, ed),
+          () => this.blockSearchStatus()
         ).open();
       },
     });
@@ -236,7 +266,7 @@ export default class ZobPlugin extends Plugin {
     this.addCommand({
       id: "zob-status",
       name: "Show status & capabilities",
-      callback: () => this.showStatus(),
+      callback: () => void this.showStatus(),
     });
 
     this.addCommand({
@@ -416,6 +446,9 @@ export default class ZobPlugin extends Plugin {
   private async tick(verbose: boolean) {
     this.caps.extractor =
       this.settings.enableEquations && !!this.settings.mineruToken;
+    // Config-only check (no network) — reachability is probed lazily in
+    // embedderHealth() when the status is actually shown.
+    this.caps.embedder = !!this.embedder();
 
     const bridgeOk = await this.bridge.ping();
     this.bridgeOk = bridgeOk;
@@ -767,6 +800,68 @@ export default class ZobPlugin extends Plugin {
     });
   }
 
+  /** Reachability + identity of the configured embedder. Cached ~60s so it's
+   *  cheap to call from the status command / block modal; never on the timer. */
+  async embedderHealth(force = false): Promise<EmbedderHealth> {
+    const now = Date.now();
+    if (
+      !force &&
+      this.embedderHealthCache &&
+      now - this.embedderHealthCache.at < 60_000
+    ) {
+      return this.embedderHealthCache.health;
+    }
+    const ollama = this.settings.embedderBackend === "ollama";
+    const backend = ollama ? "Ollama" : "Voyage";
+    const model = ollama
+      ? this.settings.ollamaModel
+      : this.settings.embedModel || "voyage-3.5-lite";
+    const embedder = this.embedder();
+    let health: EmbedderHealth;
+    if (!embedder) {
+      health = {
+        configured: false,
+        reachable: false,
+        backend,
+        model,
+        note: ollama ? "run Ollama + pull a model" : "set a Voyage API key",
+      };
+    } else {
+      const p = await embedder.probe();
+      health = { configured: true, reachable: p.ok, backend, model, note: p.note };
+    }
+    this.embedderHealthCache = { at: now, health };
+    return health;
+  }
+
+  /** Invalidate the cached probe (e.g. after a settings change). */
+  resetEmbedderHealth() {
+    this.embedderHealthCache = null;
+  }
+
+  /** One-line status for the block-import modal: are we ranking semantically
+   *  (embedder reachable + this paper's blocks embedded) or lexically, and why. */
+  async blockSearchStatus(): Promise<{ label: string; detail: string }> {
+    const key = this.current?.attachment?.key;
+    const entry = key ? this.eqCache.get(key) : undefined;
+    const total = entry?.blocks.length ?? 0;
+    const embedded = entry?.blocks.filter((b) => b.vector).length ?? 0;
+    const h = await this.embedderHealth();
+    if (h.reachable && embedded > 0) {
+      return {
+        label: "Semantic",
+        detail: `${h.backend}${h.model ? ` (${h.model})` : ""} · ${embedded}/${total} blocks`,
+      };
+    }
+    // Lexical right now — say why (so a silent fallback becomes visible).
+    const why = !h.configured
+      ? "no embedder → set a Voyage key or run Ollama"
+      : !h.reachable
+        ? `${h.backend} unreachable → ${h.note}`
+        : `embedding ${embedded}/${total} blocks…`;
+    return { label: "Lexical", detail: why };
+  }
+
   /** Embed the given blocks in place (attaches `.vector`), chunked by the
    *  embedder. Returns false if no embedder is configured or the count didn't
    *  match. Does not persist — the caller owns saving. */
@@ -890,6 +985,41 @@ export default class ZobPlugin extends Plugin {
       }
     }
     editor.replaceSelection(text);
+  }
+
+  /** Inline block autocomplete (the "::" trigger): semantic block search mapped
+   *  onto Suggestions so it flows through the shared EditorSuggest insert path
+   *  (insertTextFor adds the page backlink, same as insertBlock). */
+  async getBlockSuggestions(query: string): Promise<Suggestion[]> {
+    const key = this.current?.attachment?.key;
+    if (!key || !this.hasBlocks()) return [];
+    // Backfill this paper's block vectors once (semantic ranking kicks in once
+    // they land; searchBlocks ranks lexically meanwhile).
+    if (!this.blocksEnsured.has(key)) {
+      this.blocksEnsured.add(key);
+      void this.ensureBlockVectors(key);
+    }
+    const hits = await this.searchBlocks(query);
+    return hits.map((h) => this.blockToSuggestion(h));
+  }
+
+  private blockToSuggestion(h: BlockHit): Suggestion {
+    const preview = h.text
+      .replace(/\$\$[\s\S]*?\$\$/g, " [eq] ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const label = preview.length > 120 ? preview.slice(0, 119) + "…" : preview;
+    const detail = [h.heading, typeof h.page === "number" ? `p.${h.page + 1}` : null]
+      .filter(Boolean)
+      .join("  ·  ");
+    return {
+      kind: "block",
+      label,
+      detail: detail || undefined,
+      insert: h.text,
+      page: typeof h.page === "number" ? h.page : undefined,
+      score: 0,
+    };
   }
 
   // ---- paper extraction (pluggable backend) -----------------------------
@@ -1126,11 +1256,12 @@ export default class ZobPlugin extends Plugin {
       `${mark(this.caps.zotero)} Zotero (base)`,
       `${mark(this.caps.bridge)} Bridge (live tab/page/selection)`,
       `${mark(this.caps.extractor)} Extractor (equations/theorems/figures)`,
+      `${mark(this.caps.embedder)} Semantic (block import by meaning)`,
     ].join("   ");
   }
 
   /** Notice with the current paper, active tiers, and how to enable missing ones. */
-  private showStatus() {
+  private async showStatus() {
     const lines: string[] = [];
     lines.push(
       this.current?.item
@@ -1150,6 +1281,12 @@ export default class ZobPlugin extends Plugin {
       `${this.caps.extractor ? "✓" : "○"} Content — extractor` +
         (this.caps.extractor ? "" : "  → set a MinerU token in settings")
     );
+    // Reachability-probed (not just configured), so ✓ means it actually works.
+    const h = await this.embedderHealth();
+    lines.push(
+      `${h.reachable ? "✓" : "○"} Semantic — ${h.backend}` +
+        (h.reachable ? ` (${h.model})` : `  → ${h.note}`)
+    );
     new Notice(lines.join("\n"), 10000);
   }
 
@@ -1157,10 +1294,15 @@ export default class ZobPlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    // Migrate the previous default without changing deliberately customized
+    // triggers. New installs use "::" from DEFAULT_SETTINGS.
+    if (this.settings.blockTrigger === ";;;") this.settings.blockTrigger = "::";
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
+    // Config may have changed the embedder — re-probe on next status read.
+    this.resetEmbedderHealth();
   }
 }
 

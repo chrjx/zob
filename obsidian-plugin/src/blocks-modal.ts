@@ -20,10 +20,29 @@ export class BlockImportModal extends SuggestModal<BlockHit> {
     app: App,
     private editor: Editor,
     private search: (q: string) => Promise<BlockHit[]>,
-    private insert: (hit: BlockHit, editor: Editor) => void
+    private insert: (hit: BlockHit, editor: Editor) => void,
+    private status?: () => Promise<{ label: string; detail: string }>
   ) {
     super(app);
     this.setPlaceholder("Import block: type a phrase or concept (e.g. profit maximization)…");
+  }
+
+  onOpen() {
+    super.onOpen();
+    void this.refreshStatus();
+  }
+
+  /** Show whether ranking is Semantic or Lexical (and why) in the footer, so a
+   *  silent lexical fallback is visible. Re-read because backfilled vectors can
+   *  land after the modal opens (Lexical → Semantic). */
+  private async refreshStatus() {
+    if (!this.status) return;
+    try {
+      const s = await this.status();
+      this.setInstructions([{ command: s.label, purpose: s.detail }]);
+    } catch {
+      /* status is best-effort */
+    }
   }
 
   async getSuggestions(query: string): Promise<BlockHit[]> {
@@ -36,6 +55,7 @@ export class BlockImportModal extends SuggestModal<BlockHit> {
       const results = await this.search(query);
       if (mine !== this.token) return this.last;
       this.last = results;
+      void this.refreshStatus();
       return results;
     } catch (e) {
       console.error("[Zob] block search failed", e);

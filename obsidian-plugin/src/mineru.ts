@@ -284,23 +284,40 @@ function parseContentFromZip(zip: Uint8Array): ExtractedContent {
   }
 
   if (arr) {
+    let lastBlock: ExtractedBlock | null = null;
     for (let i = 0; i < arr.length; i++) {
       const b = arr[i];
       const t = String(b?.type ?? "");
       if (t.includes("equation")) {
+        // A display equation is part of the surrounding paragraph — it does NOT
+        // break `lastBlock` (so the continuation prose can stitch back on).
         pushEq(b.latex ?? b.text ?? "", numOrNull(b.page_idx));
       } else if (t === "image" || t === "table" || t === "chart") {
         const fig = readFigure(files, b, t);
         if (fig) figures.push(fig);
+        lastBlock = null; // a figure breaks the paragraph
       } else if (t === "text") {
         const stmt = readStatement(arr, i);
         if (stmt) statements.push(stmt);
         // Track section headings; build a prose block for each paragraph.
         if (b.text_level != null) {
           heading = String(b.text ?? "").trim() || heading;
+          lastBlock = null; // a heading breaks the paragraph
         } else {
-          const blk = readBlock(arr, i, heading);
-          if (blk) blocks.push(blk);
+          const para = String(b.text ?? "").trim();
+          if (isBlockContinuation(lastBlock, para)) {
+            // Sentence was split by a display equation — stitch the continuation
+            // (and its own trailing equations) back onto the same block.
+            lastBlock!.text += `\n\n${para}${trailingEquations(arr, i)}`;
+          } else {
+            const blk = readBlock(arr, i, heading);
+            if (blk) {
+              blocks.push(blk);
+              lastBlock = blk;
+            } else {
+              lastBlock = null;
+            }
+          }
         }
       }
     }
@@ -332,18 +349,53 @@ function readBlock(
   // Require a section heading (drops cover/masthead/boilerplate before §1) and
   // skip page numbers / short running heads.
   if (!heading || para.length < 40) return null;
+  return {
+    heading,
+    text: para + trailingEquations(arr, i),
+    page: numOrNull(b.page_idx),
+  };
+}
 
-  let text = para;
+/** The display equations ($$…$$) immediately following item `i`, up to 4,
+ *  as a markdown suffix (empty string if none). */
+function trailingEquations(arr: any[], i: number): string {
+  let out = "";
   let appended = 0;
   for (let j = i + 1; j < arr.length && appended < 4; j++) {
     if (!String(arr[j]?.type ?? "").includes("equation")) break;
     const eq = cleanLatex(arr[j].latex ?? arr[j].text ?? "");
     if (eq) {
-      text += `\n\n$$\n${eq}\n$$`;
+      out += `\n\n$$\n${eq}\n$$`;
       appended++;
     }
   }
-  return { heading, text, page: numOrNull(b.page_idx) };
+  return out;
+}
+
+/** Capitalized connectives that, right after a display equation, still continue
+ *  the sentence explaining it ("Where P^b is…", "Here x denotes…", "Note that…").
+ *  Lowercase forms are already caught by the lowercase-start rule below. */
+const CONTINUATION_CONNECTIVE =
+  /^(where|which|here|with|such that|so that|for all|in which|that is|given|denotes?|note that|then|thus|hence|therefore|setting|substituting|using|taking|recall|whereas|while)\b/i;
+
+/** True when `para` is a continuation of the previous block that MinerU split —
+ *  at a display equation, a column, or a page break — so the two are really one
+ *  block. Primary signal: `para` starts lowercase (well-formed paragraphs never
+ *  do, so a lowercase "paragraph" is a split-off tail). Right after a display
+ *  equation we also accept an inline-math or capitalized-connective start. Stitches
+ *  "…the mid-price:  [EQ]  where P^b is…" back into one block. */
+function isBlockContinuation(
+  last: ExtractedBlock | null,
+  para: string
+): boolean {
+  if (!last || !para) return false;
+  // A paragraph beginning lowercase is almost always a split-off continuation.
+  if (/^[a-z]/.test(para)) return true;
+  // Just after a display equation: "$P^b$ is…" (inline math) or "Where…"/"Here…".
+  if (last.text.trimEnd().endsWith("$$")) {
+    return /^\$/.test(para) || CONTINUATION_CONNECTIVE.test(para);
+  }
+  return false;
 }
 
 /** A labeled statement text block, plus its trailing display equations. */

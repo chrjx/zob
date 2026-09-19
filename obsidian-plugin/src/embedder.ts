@@ -13,6 +13,12 @@ export interface Embedder {
    * stored blocks, "query" for the search string (improves match quality).
    */
   embed(texts: string[], type: "document" | "query"): Promise<number[][]>;
+  /**
+   * Lightweight reachability check for status display — is the backend usable
+   * right now? Cheap (no embedding cost): a GET for Ollama, key-presence for
+   * Voyage. `note` is a short hint when `ok` is false.
+   */
+  probe(): Promise<{ ok: boolean; note: string }>;
 }
 
 export interface EmbedderConfig {
@@ -53,6 +59,29 @@ class OllamaEmbedder implements Embedder {
 
   isConfigured(): boolean {
     return !!this.baseUrl && !!this.model;
+  }
+
+  async probe(): Promise<{ ok: boolean; note: string }> {
+    try {
+      const res = await requestUrl({
+        url: `${this.baseUrl}/api/tags`,
+        method: "GET",
+        throw: false,
+      });
+      if (res.status !== 200) return { ok: false, note: "run 'ollama serve'" };
+      // Tags carry a :tag suffix (e.g. nomic-embed-text:latest) — match by base.
+      const names: string[] = (res.json?.models ?? []).map(
+        (m: any) => m.name ?? m.model ?? ""
+      );
+      const has = names.some(
+        (n) => n === this.model || n.split(":")[0] === this.model
+      );
+      return has
+        ? { ok: true, note: "reachable" }
+        : { ok: false, note: `pull '${this.model}'` };
+    } catch {
+      return { ok: false, note: "run 'ollama serve'" };
+    }
   }
 
   private prefix(text: string, type: "document" | "query"): string {
@@ -134,6 +163,14 @@ class VoyageEmbedder implements Embedder {
 
   isConfigured(): boolean {
     return !!this.apiKey;
+  }
+
+  async probe(): Promise<{ ok: boolean; note: string }> {
+    // A real API call is rate-limited on the free tier; treat a present key as
+    // ready rather than spending a request just to draw a status dot.
+    return this.apiKey
+      ? { ok: true, note: "API key set" }
+      : { ok: false, note: "set a Voyage API key" };
   }
 
   async embed(

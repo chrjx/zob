@@ -12,8 +12,6 @@ export interface ZobSettings {
   pollIntervalMs: number;
   /** Free MinerU cloud API token (for equation -> LaTeX extraction). */
   mineruToken: string;
-  /** Optional Anthropic API key for the Claude vision equation fallback. */
-  anthropicApiKey: string;
   /** Embedding backend for semantic block search. */
   embedderBackend: "voyage" | "ollama";
   /** Voyage API key for semantic block search (free tier works). */
@@ -52,6 +50,8 @@ export interface ZobSettings {
   citationTrigger: string;
   /** Trigger string for paper-context autocomplete (terms/figures/equations). */
   paperTrigger: string;
+  /** Trigger string for semantic block autocomplete (whole paragraphs). */
+  blockTrigger: string;
   /** Frontmatter property holding a note's Better BibTeX citekey. */
   citekeyProperty: string;
   /** Frontmatter property holding a note's Zotero item key. */
@@ -89,7 +89,6 @@ export const DEFAULT_SETTINGS: ZobSettings = {
   autoTrackRecent: true,
   pollIntervalMs: 2000,
   mineruToken: "",
-  anthropicApiKey: "",
   embedderBackend: "voyage",
   voyageApiKey: "",
   embedModel: "voyage-3.5-lite",
@@ -109,6 +108,7 @@ export const DEFAULT_SETTINGS: ZobSettings = {
   figureTemplate: FIGURE_TEMPLATES["embed-caption"],
   citationTrigger: "@",
   paperTrigger: ";;",
+  blockTrigger: "::",
   citekeyProperty: "citekey",
   zoteroKeyProperty: "zotero-key",
   literatureFolder: "Zotero",
@@ -244,6 +244,20 @@ export class ZobSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.paperTrigger)
           .onChange(async (v) => {
             this.plugin.settings.paperTrigger = v.slice(0, 4) || ";;";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Block trigger")
+      .setDesc(
+        "Type a phrase/concept to import a whole matching paragraph (with its equations), ranked semantically (e.g. ::profit maximization). Use a string that doesn't collide with the paper trigger."
+      )
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.blockTrigger)
+          .onChange(async (v) => {
+            this.plugin.settings.blockTrigger = v.slice(0, 4) || "::";
             await this.plugin.saveSettings();
           })
       );
@@ -496,19 +510,6 @@ export class ZobSettingTab extends PluginSettingTab {
                 await this.plugin.saveEqCache();
               }
             }
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Anthropic API key (optional)")
-      .setDesc("Enables the Claude vision fallback for extracting a single equation region.")
-      .addText((t) =>
-        t
-          .setPlaceholder("sk-ant-…")
-          .setValue(this.plugin.settings.anthropicApiKey)
-          .onChange(async (v) => {
-            this.plugin.settings.anthropicApiKey = v.trim();
-            await this.plugin.saveSettings();
           })
       );
 
